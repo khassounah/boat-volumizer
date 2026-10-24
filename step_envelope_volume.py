@@ -19,6 +19,11 @@ at geometric breakpoints (vertex heights and edge z-extrema), so kinks in A(z)
 (e.g. where a sheer line starts, horizontal faces) fall on interval boundaries
 and no slice is ever taken exactly on a horizontal face.
 
+Displacement table: for waterlines at 10%, 20%, ... 100% of the model height
+(measured from its lowest point along the slicing axis), V(h) is the envelope
+volume below h. Waterline heights are forced integration boundaries, so each
+value is as accurate as the total.
+
 Lengths: the OCCT STEP reader converts to millimetres, so volumes are mm^3.
 """
 import argparse
@@ -150,12 +155,66 @@ def fill_holes(geom):
     return unary_union([Polygon(p.exterior) for p in polygons(geom)])
 
 
+def mouths(pocket, hull, tol):
+    """Runs of the pocket boundary on the convex hull boundary -> (total, widest) mouth width.
+    A pocket can have several mouths, e.g. an open deck plus a porthole breaking the wall."""
+    hc = list(hull.exterior.coords)
+    pc = list(pocket.exterior.coords)
+
+    def on_hull(mx, my):
+        for (ax, ay), (bx, by) in zip(hc[:-1], hc[1:]):
+            dx, dy = bx - ax, by - ay
+            l2 = dx * dx + dy * dy
+            if l2 == 0:
+                continue
+            t = ((mx - ax) * dx + (my - ay) * dy) / l2
+            if 0 <= t <= 1 and (ax + t * dx - mx) ** 2 + (ay + t * dy - my) ** 2 <= tol * tol:
+                return True
+        return False
+
+    segs = [(on_hull(0.5 * (x0 + x1), 0.5 * (y0 + y1)), math.hypot(x1 - x0, y1 - y0))
+            for (x0, y0), (x1, y1) in zip(pc[:-1], pc[1:])]
+    if not segs:
+        return 0.0, 0.0
+    start = next((i for i, (f, _) in enumerate(segs) if not f), 0)
+    total = widest = run = 0.0
+    for k in range(len(segs)):
+        f, ln = segs[(start + k) % len(segs)]
+        if f:
+            run += ln; total += ln; widest = max(widest, run)
+        else:
+            run = 0.0
+    return total, widest
+
+
+def cluster_pieces(pieces, max_gap):
+    """Group a slice's filled outlines that share one closing hull. With no gap limit
+    everything is one group, so walls broken by portholes or scuppers still close."""
+    if len(pieces) <= 1:
+        return [pieces] if pieces else []
+    if math.isinf(max_gap):
+        return [pieces]
+    zones = polygons(unary_union([p.buffer(0.5 * max_gap) for p in pieces]))
+    groups = [[] for _ in zones]
+    for p in pieces:
+        pt = p.representative_point()
+        k = next((i for i, z in enumerate(zones) if z.contains(pt)), 0)
+        groups[k].append(p)
+    return [g for g in groups if g]
+
+
+ELONGATED = 40         # perimeter^2 / area of a strip (wall segment between portholes); disc 12.6
+MIN_ENCLOSURE = 0.05   # pocket area / mouth^2; half-disc 0.39, deep U > 1, shallow inward curve ~0.01
+
+
 def analyze_slice(lines, eps, wall_ratio, max_gap, close=True):
     """
     Split one slice into filled outer loops ("pieces") and candidate openings
-    ("pockets" = convex-hull pockets of each piece, i.e. regions a straight chord
-    across a gap would enclose). Each pocket carries a seed flag: True when its
-    piece looks like a wall (thin relative to its size).
+    ("pockets" = convex-hull pockets of each group of pieces, i.e. regions straight
+    chords across the gaps would enclose). A pocket is seeded as an opening when the
+    group looks like a wall (thin relative to its size) AND the pocket is enclosed by
+    it (area / mouth^2 >= MIN_ENCLOSURE), so shallow inward curves of a closed outline
+    are not filled.
     All geometry is in eps-dilated space; finalize_region() erodes it back.
     """
     if not lines:
@@ -163,18 +222,39 @@ def analyze_slice(lines, eps, wall_ratio, max_gap, close=True):
     band = MultiLineString(lines).buffer(eps, quad_segs=4)
     pieces = polygons(fill_holes(band))
     pockets = []
-    if close:
-        for p in pieces:
-            hull = p.convex_hull
-            t_eq = 2.0 * p.area / p.length                 # equivalent wall thickness
-            seed = t_eq <= wall_ratio * math.sqrt(hull.area)
-            rim = hull.exterior.buffer(0.5 * eps)
-            for k in polygons(hull.difference(p)):
-                if k.area < 4 * eps * eps:
-                    continue
-                if not math.isinf(max_gap) and k.exterior.intersection(rim).length > max_gap + 2 * eps:
-                    continue
-                pockets.append([k, seed])
+    if not close:
+        return pieces, pockets
+    band_polys = polygons(band)
+    # classify: thin "wall" outlines vs chunky ones (closed sections, fittings, keels)
+    info = []
+    for p in pieces:
+        hull = p.convex_hull
+        per, area, ha = p.length, p.area, hull.area
+        wall = per > 0 and (2 * area / per <= wall_ratio * math.sqrt(ha)
+                            or (per * per >= ELONGATED * area and area >= 0.9 * ha))
+        info.append((p, hull, ha, wall))
+    total_hull = sum(x[2] for x in info)
+    groups = [(g, True, None) for g in cluster_pieces([x[0] for x in info if x[3]], max_gap)]
+    # chunky outlines keep their own pockets (closable only by an opening continuing from a
+    # neighbouring slice, e.g. the stubby top of a thick rim); tiny ones such as fittings are skipped
+    # an outline with a second loop nested inside it (outer + inner skin of a closed hull
+    # section) has no openings by construction, so nothing may be propagated into it
+    groups += [([p], False, hull) for p, hull, ha, wall in info
+               if not wall and ha >= 0.01 * total_hull
+               and sum(1 for q in band_polys if p.contains(q.representative_point())) < 2]
+    for group, wall, hull0 in groups:
+        solid = group[0] if len(group) == 1 else unary_union(group)
+        hull = hull0 if hull0 is not None else solid.convex_hull
+        if not isinstance(hull, Polygon):
+            continue
+        for k in polygons(hull.difference(solid)):
+            if k.area < 4 * eps * eps:
+                continue
+            total, widest = mouths(k, hull, 0.05 * eps)
+            if not math.isinf(max_gap) and widest > max_gap + 2 * eps:
+                continue
+            mouth = max(total, eps)
+            pockets.append([k, wall and k.area / mouth ** 2 >= MIN_ENCLOSURE])
     return pieces, pockets
 
 
@@ -227,7 +307,9 @@ def breakpoints(shape, zmin, zmax, lin_defl):
     return np.clip(np.array(zs), zmin, zmax)
 
 
-def build_intervals(bps, zmin, zmax, min_intervals, max_intervals):
+def build_intervals(bps, zmin, zmax, min_intervals, max_intervals, forced=()):
+    """Integration intervals. `forced` heights (waterlines) are always interval
+    boundaries, so the running integral is exact at each of them."""
     span = zmax - zmin
     min_dz = span / max_intervals
     pts = [zmin]
@@ -238,6 +320,12 @@ def build_intervals(bps, zmin, zmax, min_intervals, max_intervals):
         pts[-1] = zmax
     else:
         pts.append(zmax)
+    forced = [f for f in forced if zmin < f < zmax]
+    tol = 1e-9 * span
+    pts = [p for p in pts
+           if p in (zmin, zmax) or all(abs(p - f) >= 0.25 * min_dz for f in forced)]
+    pts = sorted(set(pts) | set(forced))
+    pts = [p for i, p in enumerate(pts) if i == 0 or p - pts[i - 1] > tol]
     max_dz = span / min_intervals
     out = []
     for a, b in zip(pts[:-1], pts[1:]):
@@ -260,8 +348,12 @@ def run(args):
     eps = args.gap_tol if args.gap_tol else 1e-4 * diag
     max_gap = args.max_gap if args.max_gap is not None else math.inf
 
+    step = args.waterline_step
+    pcts = [] if step <= 0 else [k * step for k in range(1, int(math.floor(100 / step + 1e-9)) + 1)]
+    wl_heights = [zmin + p / 100.0 * (zmax - zmin) for p in pcts]
     intervals = build_intervals(breakpoints(shape, zmin, zmax, lin_defl),
-                                zmin, zmax, args.min_intervals, args.max_intervals)
+                                zmin, zmax, args.min_intervals, args.max_intervals,
+                                forced=wl_heights)
     nodes, weights = np.polynomial.legendre.leggauss(args.gauss)
     n_slices = len(intervals) * args.gauss
     print(f"bbox {xmax - xmin:.3f} x {ymax - ymin:.3f} x {zmax - zmin:.3f} mm "
@@ -277,21 +369,35 @@ def run(args):
                 failed += 1
                 lines = []
             pieces, pockets = analyze_slice(lines, eps, args.wall_ratio, max_gap, not args.no_close)
-            slices.append(dict(z=z, w=half * w, lines=lines, pieces=pieces, pockets=pockets))
+            slices.append(dict(z=z, w=half * w, top=b, lines=lines, pieces=pieces, pockets=pockets))
             if not args.quiet and len(slices) % max(1, n_slices // 10) == 0:
                 print(f"  {100 * len(slices) // n_slices:3d}%", file=sys.stderr)
 
     propagate_openings(slices)
-    volume, samples = 0.0, []
+    volume, samples, interval_tops = 0.0, [], []
     for s in slices:
         region = finalize_region(s["pieces"], s["pockets"], eps)
         volume += s["w"] * region.area
         samples.append((s["z"], region.area, s["lines"], region))
+        interval_tops.append((s["top"], volume))     # running integral at interval top
+
+    # displacement V(h) = integral of envelope area from the bottom up to waterline h
+    waterlines = []
+    for pct, h in zip(pcts, wl_heights):
+        disp = 0.0
+        for top, run in interval_tops:
+            if top <= h + 1e-9 * (zmax - zmin):
+                disp = run
+        waterlines.append((pct, h - zmin, disp))
 
     mat = material_volume(shape)
     print(f"envelope volume : {volume:,.3f} mm^3  ({volume * 1e-6:,.6f} L)")
     if mat is not None:
         print(f"material volume : {mat:,.3f} mm^3  ({mat * 1e-6:,.6f} L)  [exact, solids only]")
+    if waterlines:
+        print(f"waterline  height_mm  displacement_mm^3   (height above bottom; total {zmax - zmin:.3f} mm)")
+        for pct, h, disp in waterlines:
+            print(f"wl {pct:5.1f}%  {h:10.3f}  {disp:18,.3f}")
     if failed:
         print(f"warning: {failed} section(s) failed and counted as empty", file=sys.stderr)
 
@@ -351,6 +457,9 @@ def main():
     ap.add_argument("--max-intervals", type=int, default=200,
                     help="cap on breakpoint-driven intervals (default 200)")
     ap.add_argument("--gauss", type=int, default=3, help="Gauss points per interval (default 3)")
+    ap.add_argument("--waterline-step", type=float, default=10.0,
+                    help="waterline increment in percent of total height for the displacement "
+                         "table (default 10; 0 disables)")
     ap.add_argument("--csv", help="write the A(z) profile to this CSV")
     ap.add_argument("--plot", help="write a PNG grid of sample slices")
     ap.add_argument("--plot-count", type=int, default=8, help="slices in the plot (default 8)")
